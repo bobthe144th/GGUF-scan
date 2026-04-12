@@ -24,16 +24,18 @@ The open-source community deserves better tooling here. `gguf-scan` is a small p
 
 `gguf-scan` parses the GGUF binary format directly and validates:
 
-|Check                     |What it catches                                                                                                                             |
-|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-|**Magic bytes**           |Files that aren’t GGUF at all, or are so corrupted the header is unreadable                                                                 |
-|**Version field**         |Files from future format versions or with a garbage version integer                                                                         |
-|**Header counts**         |Implausibly large tensor or KV counts that indicate header corruption                                                                       |
-|**KV metadata**           |Every key-value entry: type validity, string bounds, nested array lengths                                                                   |
-|**Tensor info**           |Every tensor: name, dimension count, shape, ggml_type, data offset                                                                          |
-|**Tensor data bounds**    |Computes expected byte size from shape + quantization type and confirms it fits in the file — catches truncated downloads and partial writes|
-|**Quantization alignment**|Verifies element counts are divisible by block sizes for block-quantized formats (Q4_K_M, Q6_K, Q8_0, etc.)                                 |
-|**Deep checksum**         |Optional SHA-256 of the full file for transfer verification                                                                                 |
+|Check                                  |What it catches                                                                                                                                                                                          |
+|---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|**Magic bytes**                        |Files that aren’t GGUF at all, or are so corrupted the header is unreadable                                                                                                                              |
+|**Version field**                      |Files from future format versions or with a garbage version integer                                                                                                                                      |
+|**Header counts**                      |Implausibly large tensor or KV counts that indicate header corruption                                                                                                                                    |
+|**KV metadata**                        |Every key-value entry: type validity, string bounds, nested array lengths                                                                                                                                |
+|**Tensor info**                        |Every tensor: name, dimension count, shape, ggml_type, data offset                                                                                                                                       |
+|**Tensor data bounds**                 |Computes expected byte size from shape + quantization type and confirms it fits in the file — catches truncated downloads and partial writes                                                             |
+|**Quantization alignment**             |Verifies element counts are divisible by block sizes for block-quantized formats (Q4_K_M, Q6_K, Q8_0, etc.)                                                                                              |
+|**Block scale headers** *(–stat-check)*|Reads every block’s scale field(s) — flags NaN, Inf, zero, and out-of-range values; detects degenerate tensors where all scales are identical                                                            |
+|**Sampled stat scan** *(–stat-scan)*   |Randomly samples 1% of blocks per tensor; checks zero-block ratio and longest run of consecutive identical blocks — catches memcpy overwrites and partial-write corruption invisible to structural checks|
+|**Deep checksum** *(–deep)*            |SHA-256 of the full file for transfer verification                                                                                                                                                       |
 
 -----
 
