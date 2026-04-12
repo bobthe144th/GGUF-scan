@@ -11,7 +11,6 @@ python gguf_scan.py model.gguf –deep  # checksum tensor data blocks
 
 import argparse
 import json
-import os
 import struct
 import sys
 import hashlib
@@ -379,19 +378,20 @@ for idx in indices:
         break
 
     # ── Scale field validation (Tier 1 core) ─────────────────────────────
-    block_bad = False
+    block_has_bad_scale = False
     for field_off, field_type in scale_layout:
         fpos = block_start + field_off
         if field_type == 'f16':
             val = _read_f16_at(data, fpos)
             if not math.isfinite(val) or val == 0.0 or abs(val) > MAX_SANE_SCALE:
-                bad_scale_count += 1
-                block_bad = True
+                block_has_bad_scale = True
             else:
                 scales.append(abs(val))
         elif field_type == 'i8':
             val = _read_i8_at(data, fpos)
             scales.append(float(val))
+    if block_has_bad_scale:
+        bad_scale_count += 1
 
     # ── Tier 2 extras: zero-block and identical-run ───────────────────────
     if full_scan:
@@ -691,14 +691,11 @@ for name, n_dims, shape, ggml_type, t_offset in tensor_infos:
         emit_stat_issues(ts, issue)
 
 # ── Tier 2: sampled stat scan (--stat-scan flag) ──────────────────────────
-# Re-walk tensors that have block info and weren't truncated.
-# We skip tensors already processed in Tier 1 to avoid double-reporting;
-# stat_scan implies stat_check, so we upgrade to full_scan=True here.
+# Upgrades Tier-1 results to full_scan=True. We replace each tensor's
+# TensorStatResult in-place rather than clearing and re-appending, so
+# Tier-1 issues already emitted are not duplicated.
 if stat_scan:
-    # Clear Tier-1 stats so we replace them with Tier-2 results
-    tier1_names = {ts.name for ts in result.tensor_stats}
-    result.tensor_stats = [ts for ts in result.tensor_stats
-                           if ts.name not in tier1_names]
+    tier1_by_name = {ts.name: i for i, ts in enumerate(result.tensor_stats)}
 
     for name, n_dims, shape, ggml_type, t_offset in tensor_infos:
         if ggml_type not in GGML_BLOCK_INFO:
@@ -707,17 +704,32 @@ if stat_scan:
         n_elements = 1
         for dim in shape:
             n_elements *= dim
-        block_elems, _ = GGML_BLOCK_INFO[ggml_type]
+        block_elems, block_bytes_t2 = GGML_BLOCK_INFO[ggml_type]
         if n_elements % block_elems != 0:
             continue
         n_blocks = n_elements // block_elems
-        if abs_offset + n_blocks * GGML_BLOCK_INFO[ggml_type][1] > stat.st_size:
+        if abs_offset + n_blocks * block_bytes_t2 > stat.st_size:
             continue   # truncated — already flagged
 
         ts = stat_check_tensor(
             data, name, ggml_type, abs_offset, n_blocks, full_scan=True)
-        result.tensor_stats.append(ts)
-        emit_stat_issues(ts, issue)
+
+        if name in tier1_by_name:
+            # Replace Tier-1 result; issues for this tensor were already
+            # emitted so only emit the Tier-2-specific ones now.
+            result.tensor_stats[tier1_by_name[name]] = ts
+            # Emit only Tier-2 extras (zero-block ratio, identical runs)
+            if ts.zero_block_ratio > ZERO_BLOCK_RATIO_THRESHOLD:
+                issue(SEVERITY_WARNING, "HIGH_ZERO_BLOCK_RATIO",
+                      f"Tensor '{ts.name}': {ts.zero_block_ratio:.1%} of sampled "
+                      f"blocks are all-zero (threshold {ZERO_BLOCK_RATIO_THRESHOLD:.0%})")
+            if ts.max_identical_run >= IDENTICAL_RUN_THRESHOLD:
+                issue(SEVERITY_WARNING, "IDENTICAL_BLOCK_RUN",
+                      f"Tensor '{ts.name}': run of {ts.max_identical_run} consecutive "
+                      f"identical blocks detected — possible memcpy / write corruption")
+        else:
+            result.tensor_stats.append(ts)
+            emit_stat_issues(ts, issue)
 
 # ── Deep scan: SHA-256 of full file ───────────────────────────────────────
 if deep:
@@ -842,7 +854,6 @@ paths = collect_paths(args.targets)
 
 do_stat_check = args.stat_check or args.stat_scan
 do_stat_scan  = args.stat_scan
-paths = collect_paths(args.targets)
 
 if not paths:
     print("No GGUF files found.", file=sys.stderr)
