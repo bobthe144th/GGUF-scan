@@ -15,11 +15,27 @@ import os
 import struct
 import sys
 import hashlib
+import math
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Optional
+
+# ── F16 decode (no numpy required) ───────────────────────────────────────────
+
+def f16_to_f32(bits: int) -> float:
+“”“Decode a raw uint16 IEEE 754 half-precision value to Python float.”””
+sign     = (bits >> 15) & 0x1
+exponent = (bits >> 10) & 0x1F
+mantissa =  bits        & 0x3FF
+if exponent == 0x1F:
+return math.copysign(math.inf if mantissa == 0 else math.nan, -1 if sign else 1)
+if exponent == 0:
+val = mantissa / 1024.0 * (2 ** -14)
+else:
+val = (1 + mantissa / 1024.0) * (2 ** (exponent - 15))
+return -val if sign else val
 
 # ── GGUF constants ────────────────────────────────────────────────────────────
 
@@ -114,6 +130,62 @@ GGML_BLOCK_INFO = {
 18: (256, 210),  # Q6_K
 }
 
+# Scale field layout per block type for stat-check.
+
+# Each entry: list of (byte_offset_in_block, field_type)
+
+# field_type: ‘f16’ | ‘i8’ | ‘u8’
+
+# For K-quants the primary super-block scale is always the first f16.
+
+BLOCK_SCALE_LAYOUT = {
+2:  [(0,  ‘f16’)],            # Q4_0:   d  at byte 0
+3:  [(0,  ‘f16’), (2, ‘f16’)],# Q4_1:   d, m
+6:  [(0,  ‘f16’)],            # Q5_0:   d
+7:  [(0,  ‘f16’), (2, ‘f16’)],# Q5_1:   d, m
+8:  [(0,  ‘f16’)],            # Q8_0:   d
+9:  [(0,  ‘f16’), (2, ‘f16’)],# Q8_1:   d, s
+10: [(0,  ‘f16’), (2, ‘f16’)],# Q2_K:   d, dmin
+11: [(0,  ‘f16’)],            # Q3_K_S: d
+12: [(0,  ‘f16’), (2, ‘f16’)],# Q3_K_M: d, dmin
+13: [(0,  ‘f16’), (2, ‘f16’)],# Q3_K_L: d, dmin
+14: [(0,  ‘f16’), (2, ‘f16’)],# Q4_K_S: d, dmin
+15: [(0,  ‘f16’), (2, ‘f16’)],# Q4_K_M: d, dmin
+16: [(0,  ‘f16’), (2, ‘f16’)],# Q5_K_S: d, dmin
+17: [(0,  ‘f16’), (2, ‘f16’)],# Q5_K_M: d, dmin
+18: [(0,  ‘f16’)],            # Q6_K:   d
+}
+
+# Reasonable absolute upper bound on a block scale value.
+
+# Scales encode the mapping from integer codes → float weights.
+
+# Real-world transformer weights rarely exceed ±10 in magnitude;
+
+# scales above ~100 almost certainly indicate bit corruption.
+
+MAX_SANE_SCALE = 100.0
+
+# Fraction of a tensor’s blocks sampled during –stat-check (Tier 2).
+
+STAT_SAMPLE_FRACTION = 0.01   # 1 %
+STAT_SAMPLE_MIN      = 64     # always check at least this many blocks
+STAT_SAMPLE_MAX      = 4096   # cap so large tensors don’t dominate runtime
+
+# A tensor whose scale std-dev is zero (all blocks identical) is suspicious
+
+# unless it has very few blocks (bias vectors, small embeddings, etc.)
+
+MIN_BLOCKS_FOR_VARIANCE_CHECK = 16
+
+# If this fraction of sampled blocks are all-zero we flag it.
+
+ZERO_BLOCK_RATIO_THRESHOLD = 0.20   # 20 %
+
+# Consecutive identical blocks that trigger a run-corruption warning.
+
+IDENTICAL_RUN_THRESHOLD = 8
+
 # ── Result types ──────────────────────────────────────────────────────────────
 
 SEVERITY_OK      = “OK”
@@ -128,6 +200,18 @@ message: str
 offset: Optional[int] = None
 
 @dataclass
+class TensorStatResult:
+name: str
+ggml_type: int
+n_blocks: int
+n_sampled: int
+bad_scale_count: int        # NaN / Inf / zero / out-of-range scales
+zero_block_ratio: float     # fraction of sampled blocks that are all-zero
+scale_mean: Optional[float]
+scale_std: Optional[float]
+max_identical_run: int      # longest run of consecutive identical blocks
+
+@dataclass
 class ScanResult:
 path: str
 file_size: int
@@ -137,6 +221,7 @@ tensor_count: Optional[int] = None
 kv_count: Optional[int] = None
 issues: list = field(default_factory=list)
 deep_checksum: Optional[str] = None
+tensor_stats: list = field(default_factory=list)   # list[TensorStatResult]
 elapsed_ms: float = 0.0
 
 ```
@@ -154,6 +239,20 @@ def to_dict(self):
             for i in self.issues
         ],
         "deep_checksum": self.deep_checksum,
+        "tensor_stats": [
+            {
+                "name": ts.name,
+                "ggml_type": ts.ggml_type,
+                "n_blocks": ts.n_blocks,
+                "n_sampled": ts.n_sampled,
+                "bad_scale_count": ts.bad_scale_count,
+                "zero_block_ratio": round(ts.zero_block_ratio, 4),
+                "scale_mean": ts.scale_mean,
+                "scale_std": ts.scale_std,
+                "max_identical_run": ts.max_identical_run,
+            }
+            for ts in self.tensor_stats
+        ],
         "elapsed_ms": round(self.elapsed_ms, 1),
     }
 ```
@@ -201,7 +300,181 @@ def string(self) -> str:
 
 MAX_FILE_SIZE = 200 * 1024 * 1024 * 1024  # 200 GB sanity cap
 
-def scan_file(path: Path, deep: bool = False) -> ScanResult:
+# ── Quantization stat checker ─────────────────────────────────────────────────
+
+def _read_f16_at(data: bytes, offset: int) -> float:
+bits = struct.unpack_from(”<H”, data, offset)[0]
+return f16_to_f32(bits)
+
+def _read_i8_at(data: bytes, offset: int) -> int:
+return struct.unpack_from(”<b”, data, offset)[0]
+
+def _block_is_zero(data: bytes, block_start: int, block_bytes: int) -> bool:
+return all(b == 0 for b in data[block_start:block_start + block_bytes])
+
+def _blocks_equal(data: bytes, off_a: int, off_b: int, block_bytes: int) -> bool:
+return data[off_a:off_a + block_bytes] == data[off_b:off_b + block_bytes]
+
+def stat_check_tensor(
+data: bytes,
+tensor_name: str,
+ggml_type: int,
+abs_offset: int,
+n_blocks: int,
+full_scan: bool,          # True = Tier 2 (sampled); False = Tier 1 (headers only, sequential)
+) -> TensorStatResult:
+“””
+Analyse block-level scale fields for a single quantized tensor.
+
+```
+Tier 1 (full_scan=False): walks ALL block headers sequentially, checks
+every scale for NaN/Inf/zero/out-of-range. Fast — reads only the first
+few bytes of each block.
+
+Tier 2 (full_scan=True): randomly samples up to STAT_SAMPLE_MAX blocks,
+computes mean/std of scales, zero-block ratio, and longest identical-block
+run within the sample.
+"""
+block_info   = GGML_BLOCK_INFO.get(ggml_type)
+scale_layout = BLOCK_SCALE_LAYOUT.get(ggml_type)
+
+# Return empty result for types we can't inspect
+if block_info is None or scale_layout is None:
+    return TensorStatResult(
+        name=tensor_name, ggml_type=ggml_type,
+        n_blocks=n_blocks, n_sampled=0,
+        bad_scale_count=0, zero_block_ratio=0.0,
+        scale_mean=None, scale_std=None, max_identical_run=0,
+    )
+
+_block_elems, block_bytes = block_info
+
+# ── Choose which block indices to visit ───────────────────────────────────
+if full_scan:
+    n_sample = max(STAT_SAMPLE_MIN, min(STAT_SAMPLE_MAX, int(n_blocks * STAT_SAMPLE_FRACTION)))
+    if n_sample >= n_blocks:
+        indices = list(range(n_blocks))
+    else:
+        # Evenly-strided sample (deterministic, no random seed needed)
+        step = n_blocks / n_sample
+        indices = [int(i * step) for i in range(n_sample)]
+else:
+    # Tier 1: all blocks, but we only read the scale bytes — very fast
+    indices = list(range(n_blocks))
+
+# ── Walk chosen blocks ────────────────────────────────────────────────────
+bad_scale_count  = 0
+zero_block_count = 0
+scales: list[float] = []
+
+prev_block_idx: Optional[int] = None
+current_run   = 1
+max_run       = 1
+
+for idx in indices:
+    block_start = abs_offset + idx * block_bytes
+
+    # Bounds guard (structural check should have caught truncation, but be safe)
+    if block_start + block_bytes > len(data):
+        break
+
+    # ── Scale field validation (Tier 1 core) ─────────────────────────────
+    block_bad = False
+    for field_off, field_type in scale_layout:
+        fpos = block_start + field_off
+        if field_type == 'f16':
+            val = _read_f16_at(data, fpos)
+            if not math.isfinite(val) or val == 0.0 or abs(val) > MAX_SANE_SCALE:
+                bad_scale_count += 1
+                block_bad = True
+            else:
+                scales.append(abs(val))
+        elif field_type == 'i8':
+            val = _read_i8_at(data, fpos)
+            scales.append(float(val))
+
+    # ── Tier 2 extras: zero-block and identical-run ───────────────────────
+    if full_scan:
+        if _block_is_zero(data, block_start, block_bytes):
+            zero_block_count += 1
+
+        if prev_block_idx is not None and idx == prev_block_idx + 1:
+            prev_start = abs_offset + prev_block_idx * block_bytes
+            if _blocks_equal(data, prev_start, block_start, block_bytes):
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 1
+        else:
+            current_run = 1
+
+    prev_block_idx = idx
+
+n_sampled = len(indices)
+zero_ratio = zero_block_count / n_sampled if n_sampled > 0 else 0.0
+
+# ── Compute mean / std of collected scale values ──────────────────────────
+scale_mean: Optional[float] = None
+scale_std:  Optional[float] = None
+if scales:
+    scale_mean = sum(scales) / len(scales)
+    if len(scales) > 1:
+        variance = sum((s - scale_mean) ** 2 for s in scales) / len(scales)
+        scale_std = math.sqrt(variance)
+    else:
+        scale_std = 0.0
+
+return TensorStatResult(
+    name=tensor_name,
+    ggml_type=ggml_type,
+    n_blocks=n_blocks,
+    n_sampled=n_sampled,
+    bad_scale_count=bad_scale_count,
+    zero_block_ratio=zero_ratio,
+    scale_mean=round(scale_mean, 6) if scale_mean is not None else None,
+    scale_std=round(scale_std,  6) if scale_std  is not None else None,
+    max_identical_run=max_run,
+)
+```
+
+def emit_stat_issues(ts: TensorStatResult, issue_fn) -> None:
+“”“Convert a TensorStatResult into scanner issues.”””
+
+```
+if ts.n_sampled == 0:
+    return
+
+# Bad scales (Tier 1)
+if ts.bad_scale_count > 0:
+    frac = ts.bad_scale_count / ts.n_sampled
+    sev  = SEVERITY_ERROR if frac > 0.02 else SEVERITY_WARNING
+    issue_fn(sev, "BAD_BLOCK_SCALES",
+             f"Tensor '{ts.name}': {ts.bad_scale_count}/{ts.n_sampled} blocks "
+             f"have NaN/Inf/zero/out-of-range scale fields ({frac:.1%})")
+
+# Degenerate variance — all scales identical (Tier 1, large tensors)
+if (ts.scale_std is not None
+        and ts.scale_std == 0.0
+        and ts.n_blocks >= MIN_BLOCKS_FOR_VARIANCE_CHECK
+        and ts.bad_scale_count == 0):
+    issue_fn(SEVERITY_WARNING, "ZERO_SCALE_VARIANCE",
+             f"Tensor '{ts.name}': all {ts.n_sampled} sampled blocks have "
+             f"identical scale values (mean={ts.scale_mean:.4f}) — "
+             f"possible copy-paste corruption")
+
+# Tier 2 extras
+if ts.zero_block_ratio > ZERO_BLOCK_RATIO_THRESHOLD:
+    issue_fn(SEVERITY_WARNING, "HIGH_ZERO_BLOCK_RATIO",
+             f"Tensor '{ts.name}': {ts.zero_block_ratio:.1%} of sampled "
+             f"blocks are all-zero (threshold {ZERO_BLOCK_RATIO_THRESHOLD:.0%})")
+
+if ts.max_identical_run >= IDENTICAL_RUN_THRESHOLD:
+    issue_fn(SEVERITY_WARNING, "IDENTICAL_BLOCK_RUN",
+             f"Tensor '{ts.name}': run of {ts.max_identical_run} consecutive "
+             f"identical blocks detected — possible memcpy / write corruption")
+```
+
+def scan_file(path: Path, deep: bool = False, stat_check: bool = False, stat_scan: bool = False) -> ScanResult:
 t0 = time.monotonic()
 result = ScanResult(
 path=str(path),
@@ -368,7 +641,7 @@ data_start = r.pos
 if data_start % alignment != 0:
     data_start += alignment - (data_start % alignment)
 
-# ── Validate tensor data bounds ───────────────────────────────────────────
+# ── Validate tensor data bounds + optional stat check ────────────────────
 for name, n_dims, shape, ggml_type, t_offset in tensor_infos:
     abs_offset = data_start + t_offset
 
@@ -384,20 +657,22 @@ for name, n_dims, shape, ggml_type, t_offset in tensor_infos:
         n_elements *= dim
 
     expected_bytes: Optional[int] = None
+    n_blocks: Optional[int] = None
     if ggml_type in GGML_BLOCK_INFO:
         block_elems, block_bytes = GGML_BLOCK_INFO[ggml_type]
         if n_elements % block_elems != 0:
             issue(SEVERITY_WARNING, "TENSOR_SHAPE_MISALIGNED",
                   f"Tensor '{name}': {n_elements} elements not divisible by block size {block_elems}")
         else:
-            expected_bytes = (n_elements // block_elems) * block_bytes
+            n_blocks = n_elements // block_elems
+            expected_bytes = n_blocks * block_bytes
     elif ggml_type in GGML_TYPE_SIZE and GGML_TYPE_SIZE[ggml_type] is not None:
         expected_bytes = n_elements * GGML_TYPE_SIZE[ggml_type]
     else:
-        # Unknown type; skip size check
         issue(SEVERITY_WARNING, "UNKNOWN_GGML_TYPE",
               f"Tensor '{name}': unknown ggml_type={ggml_type}, skipping size check")
 
+    truncated = False
     if expected_bytes is not None:
         end_offset = abs_offset + expected_bytes
         if end_offset > stat.st_size:
@@ -406,6 +681,43 @@ for name, n_dims, shape, ggml_type, t_offset in tensor_infos:
                   f"but file is only {stat.st_size} bytes "
                   f"(short by {end_offset - stat.st_size} bytes)",
                   offset=abs_offset)
+            truncated = True
+
+    # ── Tier 1: fast scale-header scan (all blocks, header bytes only) ───
+    if stat_check and not truncated and n_blocks is not None and n_blocks > 0:
+        ts = stat_check_tensor(
+            data, name, ggml_type, abs_offset, n_blocks, full_scan=False)
+        result.tensor_stats.append(ts)
+        emit_stat_issues(ts, issue)
+
+# ── Tier 2: sampled stat scan (--stat-scan flag) ──────────────────────────
+# Re-walk tensors that have block info and weren't truncated.
+# We skip tensors already processed in Tier 1 to avoid double-reporting;
+# stat_scan implies stat_check, so we upgrade to full_scan=True here.
+if stat_scan:
+    # Clear Tier-1 stats so we replace them with Tier-2 results
+    tier1_names = {ts.name for ts in result.tensor_stats}
+    result.tensor_stats = [ts for ts in result.tensor_stats
+                           if ts.name not in tier1_names]
+
+    for name, n_dims, shape, ggml_type, t_offset in tensor_infos:
+        if ggml_type not in GGML_BLOCK_INFO:
+            continue
+        abs_offset = data_start + t_offset
+        n_elements = 1
+        for dim in shape:
+            n_elements *= dim
+        block_elems, _ = GGML_BLOCK_INFO[ggml_type]
+        if n_elements % block_elems != 0:
+            continue
+        n_blocks = n_elements // block_elems
+        if abs_offset + n_blocks * GGML_BLOCK_INFO[ggml_type][1] > stat.st_size:
+            continue   # truncated — already flagged
+
+        ts = stat_check_tensor(
+            data, name, ggml_type, abs_offset, n_blocks, full_scan=True)
+        result.tensor_stats.append(ts)
+        emit_stat_issues(ts, issue)
 
 # ── Deep scan: SHA-256 of full file ───────────────────────────────────────
 if deep:
@@ -496,7 +808,7 @@ return paths
 def main():
 parser = argparse.ArgumentParser(
 prog=“gguf-scan”,
-description=“Scan GGUF files for structural corruption.”,
+description=“Scan GGUF files for structural and quantization corruption.”,
 formatter_class=argparse.RawDescriptionHelpFormatter,
 epilog=”””
 Examples:
@@ -504,12 +816,19 @@ gguf_scan.py model.gguf
 gguf_scan.py ./models/
 gguf_scan.py *.gguf –json
 gguf_scan.py model.gguf –deep
+gguf_scan.py model.gguf –stat-check
+gguf_scan.py model.gguf –stat-scan
 gguf_scan.py model.gguf –warnings-as-errors
 “””,
 )
 parser.add_argument(“targets”, nargs=”+”, help=“GGUF file(s) or director(ies) to scan”)
 parser.add_argument(”–json”,  action=“store_true”, help=“Output JSON instead of human-readable text”)
 parser.add_argument(”–deep”,  action=“store_true”, help=“Compute SHA-256 checksum of each file”)
+parser.add_argument(”–stat-check”, action=“store_true”,
+help=“Tier 1: scan every block’s scale header for NaN/Inf/zero/out-of-range values”)
+parser.add_argument(”–stat-scan”, action=“store_true”,
+help=“Tier 2: sampled stat scan — also checks zero-block ratio and identical-block runs “
+“(implies –stat-check)”)
 parser.add_argument(”–no-color”, action=“store_true”, help=“Disable ANSI color output”)
 parser.add_argument(”–warnings-as-errors”, action=“store_true”,
 help=“Treat warnings as errors for exit code purposes”)
@@ -521,6 +840,10 @@ args = parser.parse_args()
 use_color = not args.no_color and sys.stdout.isatty()
 paths = collect_paths(args.targets)
 
+do_stat_check = args.stat_check or args.stat_scan
+do_stat_scan  = args.stat_scan
+paths = collect_paths(args.targets)
+
 if not paths:
     print("No GGUF files found.", file=sys.stderr)
     sys.exit(2)
@@ -529,7 +852,7 @@ results = []
 any_error = False
 
 for path in paths:
-    result = scan_file(path, deep=args.deep)
+    result = scan_file(path, deep=args.deep, stat_check=do_stat_check, stat_scan=do_stat_scan)
 
     if args.warnings_as_errors:
         effective_ok = not result.issues  # any issue = fail
