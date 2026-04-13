@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-“””
+"""
 gguf-scan: CLI tool to detect corruption in GGUF model files.
 
 Usage:
@@ -7,7 +7,7 @@ python gguf_scan.py model.gguf
 python gguf_scan.py ./models/          # recursive scan
 python gguf_scan.py *.gguf --json
 python gguf_scan.py model.gguf --deep  # checksum tensor data blocks
-“””
+"""
 
 import argparse
 import json
@@ -24,7 +24,7 @@ from typing import Optional
 # ── F16 decode (no numpy required) ───────────────────────────────────────────
 
 def f16_to_f32(bits: int) -> float:
-“”“Decode a raw uint16 IEEE 754 half-precision value to Python float.”””
+"""Decode a raw uint16 IEEE 754 half-precision value to Python float."""
 sign     = (bits >> 15) & 0x1
 exponent = (bits >> 10) & 0x1F
 mantissa =  bits        & 0x3FF
@@ -38,7 +38,7 @@ return -val if sign else val
 
 # ── GGUF constants ────────────────────────────────────────────────────────────
 
-GGUF_MAGIC = b”GGUF”
+GGUF_MAGIC = b"GGUF"
 GGUF_VERSION_MIN = 1
 GGUF_VERSION_MAX = 3
 
@@ -133,26 +133,26 @@ GGML_BLOCK_INFO = {
 
 # Each entry: list of (byte_offset_in_block, field_type)
 
-# field_type: ‘f16’ | ‘i8’ | ‘u8’
+# field_type: 'f16' | 'i8' | 'u8'
 
 # For K-quants the primary super-block scale is always the first f16.
 
 BLOCK_SCALE_LAYOUT = {
-2:  [(0,  ‘f16’)],            # Q4_0:   d  at byte 0
-3:  [(0,  ‘f16’), (2, ‘f16’)],# Q4_1:   d, m
-6:  [(0,  ‘f16’)],            # Q5_0:   d
-7:  [(0,  ‘f16’), (2, ‘f16’)],# Q5_1:   d, m
-8:  [(0,  ‘f16’)],            # Q8_0:   d
-9:  [(0,  ‘f16’), (2, ‘f16’)],# Q8_1:   d, s
-10: [(0,  ‘f16’), (2, ‘f16’)],# Q2_K:   d, dmin
-11: [(0,  ‘f16’)],            # Q3_K_S: d
-12: [(0,  ‘f16’), (2, ‘f16’)],# Q3_K_M: d, dmin
-13: [(0,  ‘f16’), (2, ‘f16’)],# Q3_K_L: d, dmin
-14: [(0,  ‘f16’), (2, ‘f16’)],# Q4_K_S: d, dmin
-15: [(0,  ‘f16’), (2, ‘f16’)],# Q4_K_M: d, dmin
-16: [(0,  ‘f16’), (2, ‘f16’)],# Q5_K_S: d, dmin
-17: [(0,  ‘f16’), (2, ‘f16’)],# Q5_K_M: d, dmin
-18: [(0,  ‘f16’)],            # Q6_K:   d
+2:  [(0,  'f16')],            # Q4_0:   d  at byte 0
+3:  [(0,  'f16'), (2, 'f16')],# Q4_1:   d, m
+6:  [(0,  'f16')],            # Q5_0:   d
+7:  [(0,  'f16'), (2, 'f16')],# Q5_1:   d, m
+8:  [(0,  'f16')],            # Q8_0:   d
+9:  [(0,  'f16'), (2, 'f16')],# Q8_1:   d, s
+10: [(0,  'f16'), (2, 'f16')],# Q2_K:   d, dmin
+11: [(0,  'f16')],            # Q3_K_S: d
+12: [(0,  'f16'), (2, 'f16')],# Q3_K_M: d, dmin
+13: [(0,  'f16'), (2, 'f16')],# Q3_K_L: d, dmin
+14: [(0,  'f16'), (2, 'f16')],# Q4_K_S: d, dmin
+15: [(0,  'f16'), (2, 'f16')],# Q4_K_M: d, dmin
+16: [(0,  'f16'), (2, 'f16')],# Q5_K_S: d, dmin
+17: [(0,  'f16'), (2, 'f16')],# Q5_K_M: d, dmin
+18: [(0,  'f16')],            # Q6_K:   d
 }
 
 # Reasonable absolute upper bound on a block scale value.
@@ -165,11 +165,11 @@ BLOCK_SCALE_LAYOUT = {
 
 MAX_SANE_SCALE = 100.0
 
-# Fraction of a tensor’s blocks sampled during --stat-check (Tier 2).
+# Fraction of a tensor's blocks sampled during --stat-check (Tier 2).
 
 STAT_SAMPLE_FRACTION = 0.01   # 1 %
 STAT_SAMPLE_MIN      = 64     # always check at least this many blocks
-STAT_SAMPLE_MAX      = 4096   # cap so large tensors don’t dominate runtime
+STAT_SAMPLE_MAX      = 4096   # cap so large tensors don't dominate runtime
 
 # A tensor whose scale std-dev is zero (all blocks identical) is suspicious
 
@@ -187,9 +187,9 @@ IDENTICAL_RUN_THRESHOLD = 8
 
 # ── Result types ──────────────────────────────────────────────────────────────
 
-SEVERITY_OK      = “OK”
-SEVERITY_WARNING = “WARNING”
-SEVERITY_ERROR   = “ERROR”
+SEVERITY_OK      = "OK"
+SEVERITY_WARNING = "WARNING"
+SEVERITY_ERROR   = "ERROR"
 
 @dataclass
 class Issue:
@@ -302,11 +302,11 @@ MAX_FILE_SIZE = 200 * 1024 * 1024 * 1024  # 200 GB sanity cap
 # ── Quantization stat checker ─────────────────────────────────────────────────
 
 def _read_f16_at(data: bytes, offset: int) -> float:
-bits = struct.unpack_from(”<H”, data, offset)[0]
+bits = struct.unpack_from("<H", data, offset)[0]
 return f16_to_f32(bits)
 
 def _read_i8_at(data: bytes, offset: int) -> int:
-return struct.unpack_from(”<b”, data, offset)[0]
+return struct.unpack_from("<b", data, offset)[0]
 
 def _block_is_zero(data: bytes, block_start: int, block_bytes: int) -> bool:
 return all(b == 0 for b in data[block_start:block_start + block_bytes])
@@ -322,7 +322,7 @@ abs_offset: int,
 n_blocks: int,
 full_scan: bool,          # True = Tier 2 (sampled); False = Tier 1 (headers only, sequential)
 ) -> TensorStatResult:
-“””
+"""
 Analyse block-level scale fields for a single quantized tensor.
 
 ```
@@ -438,7 +438,7 @@ return TensorStatResult(
 ```
 
 def emit_stat_issues(ts: TensorStatResult, issue_fn) -> None:
-“”“Convert a TensorStatResult into scanner issues.”””
+"""Convert a TensorStatResult into scanner issues."""
 
 ```
 if ts.n_sampled == 0:
@@ -747,32 +747,32 @@ return result
 # ANSI colors (disabled automatically on non-TTY / –no-color)
 
 class C:
-RED    = “\033[91m”
-YELLOW = “\033[93m”
-GREEN  = “\033[92m”
-CYAN   = “\033[96m”
-GREY   = “\033[90m”
-BOLD   = “\033[1m”
-RESET  = “\033[0m”
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+GREY   = "\033[90m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
 
 def colorize(text: str, color: str, use_color: bool) -> str:
-return f”{color}{text}{C.RESET}” if use_color else text
+return f"{color}{text}{C.RESET}" if use_color else text
 
 def format_bytes(n: int) -> str:
-for unit in (“B”, “KB”, “MB”, “GB”, “TB”):
+for unit in ("B", "KB", "MB", "GB", "TB"):
 if n < 1024:
-return f”{n:.1f} {unit}”
+return f"{n:.1f} {unit}"
 n /= 1024
-return f”{n:.1f} PB”
+return f"{n:.1f} PB"
 
 def print_result(result: ScanResult, use_color: bool):
 ok_str = (
-colorize(“✓ OK”,      C.GREEN,  use_color) if result.ok
-else colorize(“✗ CORRUPT”, C.RED, use_color)
+colorize("✓ OK",      C.GREEN,  use_color) if result.ok
+else colorize("✗ CORRUPT", C.RED, use_color)
 )
 name = Path(result.path).name
 size_str = colorize(format_bytes(result.file_size), C.GREY, use_color)
-elapsed  = colorize(f”{result.elapsed_ms:.0f}ms”, C.GREY, use_color)
+elapsed  = colorize(f"{result.elapsed_ms:.0f}ms", C.GREY, use_color)
 
 ```
 print(f"{colorize(name, C.BOLD, use_color)}  {ok_str}  {size_str}  {elapsed}")
@@ -808,21 +808,21 @@ paths = []
 for t in targets:
 p = Path(t)
 if p.is_dir():
-paths.extend(sorted(p.rglob(”*.gguf”)))
+paths.extend(sorted(p.rglob("*.gguf")))
 elif p.exists():
 paths.append(p)
 else:
-print(f”Warning: {t!r} not found — skipping”, file=sys.stderr)
+print(f"Warning: {t!r} not found — skipping", file=sys.stderr)
 return paths
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
 parser = argparse.ArgumentParser(
-prog=“gguf-scan”,
-description=“Scan GGUF files for structural and quantization corruption.”,
+prog="gguf-scan",
+description="Scan GGUF files for structural and quantization corruption.",
 formatter_class=argparse.RawDescriptionHelpFormatter,
-epilog=”””
+epilog="""
 Examples:
 gguf_scan.py model.gguf
 gguf_scan.py ./models/
@@ -831,21 +831,21 @@ gguf_scan.py model.gguf --deep
 gguf_scan.py model.gguf --stat-check
 gguf_scan.py model.gguf --stat-scan
 gguf_scan.py model.gguf --warnings-as-errors
-“””,
+""",
 )
-parser.add_argument(“targets”, nargs=”+”, help=“GGUF file(s) or director(ies) to scan”)
-parser.add_argument(“--json”,  action=”store_true”, help=”Output JSON instead of human-readable text”)
-parser.add_argument(“--deep”,  action=”store_true”, help=”Compute SHA-256 checksum of each file”)
-parser.add_argument(“--stat-check”, action=”store_true”,
-help=”Tier 1: scan every block’s scale header for NaN/Inf/zero/out-of-range values”)
-parser.add_argument(“--stat-scan”, action=”store_true”,
-help=”Tier 2: sampled stat scan — also checks zero-block ratio and identical-block runs “
-“(implies --stat-check)”)
-parser.add_argument(“--no-color”, action=”store_true”, help=”Disable ANSI color output”)
-parser.add_argument(“--warnings-as-errors”, action=”store_true”,
-help=”Treat warnings as errors for exit code purposes”)
-parser.add_argument(“--quiet”, “-q”, action=”store_true”,
-help=”Only print files with issues”)
+parser.add_argument("targets", nargs="+", help="GGUF file(s) or director(ies) to scan")
+parser.add_argument("--json",  action="store_true", help="Output JSON instead of human-readable text")
+parser.add_argument("--deep",  action="store_true", help="Compute SHA-256 checksum of each file")
+parser.add_argument("--stat-check", action="store_true",
+help="Tier 1: scan every block's scale header for NaN/Inf/zero/out-of-range values")
+parser.add_argument("--stat-scan", action="store_true",
+help="Tier 2: sampled stat scan — also checks zero-block ratio and identical-block runs "
+"(implies --stat-check)")
+parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
+parser.add_argument("--warnings-as-errors", action="store_true",
+help="Treat warnings as errors for exit code purposes")
+parser.add_argument("--quiet", "-q", action="store_true",
+help="Only print files with issues")
 args = parser.parse_args()
 
 ```
@@ -900,5 +900,5 @@ if not args.json and len(paths) > 1:
 sys.exit(1 if any_error else 0)
 ```
 
-if **name** == “**main**”:
+if **name** == "**main**":
 main()
