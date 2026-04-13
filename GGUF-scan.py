@@ -5,8 +5,8 @@ gguf-scan: CLI tool to detect corruption in GGUF model files.
 Usage:
 python gguf_scan.py model.gguf
 python gguf_scan.py ./models/          # recursive scan
-python gguf_scan.py *.gguf –json
-python gguf_scan.py model.gguf –deep  # checksum tensor data blocks
+python gguf_scan.py *.gguf --json
+python gguf_scan.py model.gguf --deep  # checksum tensor data blocks
 “””
 
 import argparse
@@ -165,7 +165,7 @@ BLOCK_SCALE_LAYOUT = {
 
 MAX_SANE_SCALE = 100.0
 
-# Fraction of a tensor’s blocks sampled during –stat-check (Tier 2).
+# Fraction of a tensor’s blocks sampled during --stat-check (Tier 2).
 
 STAT_SAMPLE_FRACTION = 0.01   # 1 %
 STAT_SAMPLE_MIN      = 64     # always check at least this many blocks
@@ -826,26 +826,26 @@ epilog=”””
 Examples:
 gguf_scan.py model.gguf
 gguf_scan.py ./models/
-gguf_scan.py *.gguf –json
-gguf_scan.py model.gguf –deep
-gguf_scan.py model.gguf –stat-check
-gguf_scan.py model.gguf –stat-scan
-gguf_scan.py model.gguf –warnings-as-errors
+gguf_scan.py *.gguf --json
+gguf_scan.py model.gguf --deep
+gguf_scan.py model.gguf --stat-check
+gguf_scan.py model.gguf --stat-scan
+gguf_scan.py model.gguf --warnings-as-errors
 “””,
 )
 parser.add_argument(“targets”, nargs=”+”, help=“GGUF file(s) or director(ies) to scan”)
-parser.add_argument(”–json”,  action=“store_true”, help=“Output JSON instead of human-readable text”)
-parser.add_argument(”–deep”,  action=“store_true”, help=“Compute SHA-256 checksum of each file”)
-parser.add_argument(”–stat-check”, action=“store_true”,
-help=“Tier 1: scan every block’s scale header for NaN/Inf/zero/out-of-range values”)
-parser.add_argument(”–stat-scan”, action=“store_true”,
-help=“Tier 2: sampled stat scan — also checks zero-block ratio and identical-block runs “
-“(implies –stat-check)”)
-parser.add_argument(”–no-color”, action=“store_true”, help=“Disable ANSI color output”)
-parser.add_argument(”–warnings-as-errors”, action=“store_true”,
-help=“Treat warnings as errors for exit code purposes”)
-parser.add_argument(”–quiet”, “-q”, action=“store_true”,
-help=“Only print files with issues”)
+parser.add_argument(“--json”,  action=”store_true”, help=”Output JSON instead of human-readable text”)
+parser.add_argument(“--deep”,  action=”store_true”, help=”Compute SHA-256 checksum of each file”)
+parser.add_argument(“--stat-check”, action=”store_true”,
+help=”Tier 1: scan every block’s scale header for NaN/Inf/zero/out-of-range values”)
+parser.add_argument(“--stat-scan”, action=”store_true”,
+help=”Tier 2: sampled stat scan — also checks zero-block ratio and identical-block runs “
+“(implies --stat-check)”)
+parser.add_argument(“--no-color”, action=”store_true”, help=”Disable ANSI color output”)
+parser.add_argument(“--warnings-as-errors”, action=”store_true”,
+help=”Treat warnings as errors for exit code purposes”)
+parser.add_argument(“--quiet”, “-q”, action=”store_true”,
+help=”Only print files with issues”)
 args = parser.parse_args()
 
 ```
