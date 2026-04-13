@@ -14,6 +14,7 @@ import json
 import struct
 import sys
 import hashlib
+import mmap
 import math
 import time
 from dataclasses import dataclass, field
@@ -487,7 +488,8 @@ def scan_file(path: Path, deep: bool = False, stat_check: bool = False, stat_sca
 
     # ── Load file ─────────────────────────────────────────────────────────────
     try:
-        data = path.read_bytes()
+        _fh = open(path, 'rb')
+        data = mmap.mmap(_fh.fileno(), 0, access=mmap.ACCESS_READ)
     except OSError as e:
         issue(SEVERITY_ERROR, "READ_ERROR", str(e))
         result.elapsed_ms = (time.monotonic() - t0) * 1000
@@ -714,7 +716,10 @@ def scan_file(path: Path, deep: bool = False, stat_check: bool = False, stat_sca
 
     # ── Deep scan: SHA-256 of full file ───────────────────────────────────────
     if deep:
-        h = hashlib.sha256(data)
+        h = hashlib.sha256()
+        chunk_size = 1 << 23  # 8 MB chunks
+        for pos in range(0, len(data), chunk_size):
+            h.update(data[pos:pos + chunk_size])
         result.deep_checksum = h.hexdigest()
 
     # ── Final verdict ─────────────────────────────────────────────────────────
